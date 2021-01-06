@@ -1,11 +1,12 @@
-/*
- * This is the main entrypoint to your Probot app
- * @param { {app: import('probot').Application} } app
- */
-
 const axios = require("axios").default;
+const bodyParser = require("body-parser");
 const { SNOW_USER, SNOW_PASSWORD, SNOW_URL } = process.env;
-module.exports = (app) => {
+
+module.exports = (app, { getRouter }) => {
+    const router = getRouter("/service-now");
+    router.use(require("express").static("public"));
+    router.use(bodyParser.json());
+
     app.log.info("Yay, the app was loaded!");
 
     app.on("installation", async (context) => {
@@ -13,63 +14,134 @@ module.exports = (app) => {
     });
 
     app.on(["issues.opened", "issues.edited"], async (context) => {
-        const { url, body, title } = context.payload.issue;
+        const { url, body, title, number } = context.payload.issue;
+        const sender = context.payload.sender.login;
         const user = context.payload.issue.user.login;
-        app.log.info(`${context.payload.action}`);
-        app.log.info(`Url: ${url} Body: ${body} Title: ${title} User: ${user}`);
-        createOrUpdateIssueInSNOW({
-            app,
-            action: context.payload.action,
-            context,
-            url,
-            title,
-            body,
-            user,
-        });
+        app.log.info(sender);
+        // if a bot did NOT make this event
+        if (!sender.includes("[bot]")) {
+            app.log.info("Am I updating?");
+            createOrUpdateIssueInSNOW({
+                app,
+                action: context.payload.action,
+                context,
+                url,
+                title,
+                body,
+                user,
+                issue_number: number,
+            });
+        }
     });
 
     app.on(
         ["issue_comment.created", "issue_comment.edited"],
         async (context) => {
-            app.log.info(`${context.payload.action}`);
-
             const { url, body, title } = context.payload.issue;
             const user = context.payload.issue.user.login;
+            const sender = context.payload.sender.login;
             const comment_url = context.payload.comment.url;
             const comment_user = context.payload.comment.user.login;
             const comment_body = context.payload.comment.body;
 
-            if (context.payload.action === "edited") {
-                const from = context.payload.changes.body.from;
-                updateCommentInSNOW({
-                    app,
-                    context,
-                    url,
-                    title,
-                    body,
-                    user,
-                    comment_url,
-                    comment_user,
-                    comment_body,
-                    from,
-                });
-            } else {
-                createCommentInSNOW({
-                    app,
-                    context,
-                    url,
-                    title,
-                    body,
-                    user,
-                    comment_url,
-                    comment_user,
-                    comment_body,
-                });
+            // if a bot did NOT make this event
+            if (!sender.includes("[bot]")) {
+                if (context.payload.action === "edited") {
+                    app.log.info("Cannot update work notes in Service Now");
+                } else {
+                    createCommentInSNOW({
+                        app,
+                        context,
+                        url,
+                        title,
+                        body,
+                        user,
+                        comment_url,
+                        comment_user,
+                        comment_body,
+                    });
+                }
             }
         }
     );
+
+    router.post("/:owner/:repo/update", async (req, res) => {
+        const { owner, repo } = req.params;
+        const appOctokit = await app.auth();
+        const response = await appOctokit.request(
+            "GET /repos/{owner}/{repo}/installation",
+            {
+                owner,
+                repo,
+            }
+        );
+
+        const installationOctokit = await app.auth(response.data.id);
+        let body, meta_data, issue_number;
+        const {
+            incident_number,
+            short_description,
+            description,
+            sys_id,
+            user,
+            work_notes,
+        } = req.body;
+        app.log.info(`Request: ${JSON.stringify(req.body)}`);
+
+        if (hasMetaData(description)) {
+            [meta_data, body] = getMetaData(description);
+            // strip SNOW metadata and replace with GitHub Metaadata
+            body = `<!-- { "isSnowIntegratorMetaData": "true", "incident_number":"${incident_number}", "sys_id":"${sys_id}", "url":"${SNOW_URL}/nav_to.do?uri=/incident.do?sys_id=${sys_id}"} -->\r\n${body}`;
+            let response = await installationOctokit.issues.update({
+                owner,
+                repo,
+                issue_number: meta_data.issue_number,
+                title: short_description,
+                body,
+            });
+            issue_number = response.data.number;
+        } else {
+            body = `<!-- { "isSnowIntegratorMetaData": "true", "incident_number":"${incident_number}", "sys_id":"${sys_id}", "url":"${SNOW_URL}/nav_to.do?uri=/incident.do?sys_id=${sys_id}"} -->\r\n${description}`;
+            let response = await installationOctokit.issues.create({
+                owner,
+                repo,
+                title: short_description,
+                body,
+            });
+            issue_number = response.data.number;
+            const url = response.data.url;
+        }
+
+        // Update Work Notes if needed
+        app.log.info(`Work Notes: ${work_notes}`);
+        if (work_notes) {
+            installationOctokit.issues.createComment({
+                owner,
+                repo,
+                issue_number,
+                body: `<!-- {"sys_id":"${sys_id}" -->\r\n${work_notes}`,
+            });
+        }
+        app.log.info(
+            `{ "isSnowIntegratorMetaDta": "true", "issue_number": "${issue_number}" }`
+        );
+
+        res.send(
+            `{ "isSnowIntegratorMetaDta": "true", "issue_number": "${issue_number}" }`
+        );
+    });
 };
+
 const base64Encode = (str) => Buffer.from(str, "utf-8").toString("base64");
+
+const hasMetaData = (str) =>
+    str.includes('<!-- { "isSnowIntegratorMetaData": "true"');
+
+const getMetaData = (body) => {
+    [meta_data, body] = body.split("-->\r\n");
+    meta_data = JSON.parse(meta_data.split("<!--")[1]);
+    return [meta_data, body];
+};
 
 const createOrUpdateIssueInSNOW = async ({
     app,
@@ -79,8 +151,10 @@ const createOrUpdateIssueInSNOW = async ({
     title,
     body,
     user,
+    issue_number,
+    issue_url,
 }) => {
-    app.log.info(`Create issue in SNOW`);
+    app.log.info(`Create or update issue in SNOW`);
     let incident_number, sys_id;
     const rest_url = `${SNOW_URL}/api/now/table/incident`;
     const headers = {
@@ -88,11 +162,14 @@ const createOrUpdateIssueInSNOW = async ({
     };
 
     try {
-        if (action === "edited") {
+        app.log.info(action);
+        app.log.info(body);
+        app.log.info(`has Meta data: ${hasMetaData(body)}`);
+        if (hasMetaData(body)) {
             // get and strip json object from body
-            [snow_data, body] = body.split("-->\r\n");
-            snow_data = JSON.parse(snow_data.split("<!--")[1]);
-            const description = `${body}\nGenerated from GitHub: ${url}`;
+            [snow_data, body] = getMetaData(body);
+            const metaDataHeader = `<!-- { "isSnowIntegratorMetaData": "true", "issue_number": "${issue_number}", "url": "${url}" } -->`;
+            const description = `${metaDataHeader}\r\n${body}\r\nGenerated from GitHub: ${url} by ${user}`;
             const response = await axios.put(
                 `${rest_url}/${snow_data.sys_id}`,
                 { short_description: title, description: description },
@@ -104,7 +181,8 @@ const createOrUpdateIssueInSNOW = async ({
                 `Incident Updated: ${incident_number} System Id: ${sys_id}`
             );
         } else {
-            const description = `${body}\nGenerated from GitHub: ${url}`;
+            const metaDataHeader = `<!-- { "isSnowIntegratorMetaData": "true", "issue_number": "${issue_number}", "url": "${url}" } -->`;
+            const description = `${metaDataHeader}\r\n${body}`;
             const response = await axios.post(
                 rest_url,
                 {
@@ -124,20 +202,20 @@ const createOrUpdateIssueInSNOW = async ({
     } catch (e) {
         app.log.error(e);
     }
+
     // update issue with incident number and URL
-    return context.octokit.issues.update(
+    // if we really want we could only do this if the meta data changes (or doesn't exist) in github
+    if (hasMetaData(body)) {
+        [snow_data, body] = getMetaData(body);
+    }
+    context.octokit.issues.update(
         context.issue({
-            body: `<!-- {"incident_number":"${incident_number}", "sys_id":"${sys_id}", "url":"${SNOW_URL}/nav_to.do?uri=/incident.do?sys_id=${sys_id}"} -->\r\n${body}`,
+            body: `<!-- { "isSnowIntegratorMetaData": "true", "incident_number":"${incident_number}", "sys_id":"${sys_id}", "url":"${SNOW_URL}/nav_to.do?uri=/incident.do?sys_id=${sys_id}"} -->\r\n${body}`,
         })
     );
 };
 
-const updateIssueInSNOW = ({ app, context, url, title, body, user, from }) => {
-    app.log.info(`Update issue in SNOW`);
-    app.log.info(`${url} ${title} ${body} ${user} ${from}`);
-};
-
-const createCommentInSNOW = ({
+const createCommentInSNOW = async ({
     app,
     context,
     url,
@@ -152,125 +230,26 @@ const createCommentInSNOW = ({
     app.log.info(
         `${url} ${title} ${body} ${user} ${comment_url} ${comment_user} ${comment_body}`
     );
-};
+    let incident_number, sys_id;
+    const rest_url = `${SNOW_URL}/api/now/table/incident`;
+    const headers = {
+        Authorization: `Basic ${base64Encode(`${SNOW_USER}:${SNOW_PASSWORD}`)}`,
+    };
 
-const updateCommentInSNOW = ({
-    app,
-    context,
-    url,
-    title,
-    body,
-    user,
-    comment_url,
-    comment_user,
-    comment_body,
-    from,
-}) => {
-    app.log.info(`Update comment in SNOW`);
-    app.log.info(
-        `${url} ${title} ${body} ${user} ${comment_url} ${comment_user} ${comment_body} ${from}`
+    [snow_data, body] = body.split("-->\r\n");
+    snow_data = JSON.parse(snow_data.split("<!--")[1]);
+    const response = await axios.put(
+        `${rest_url}/${snow_data.sys_id}`,
+        {
+            work_notes: `${comment_body}`,
+        },
+        { headers: headers }
     );
+    sys_id = response.data["result"]["sys_id"];
+    context.octokit.issues.updateComment({
+        owner: context.payload.repository.owner.login,
+        repo: context.payload.repository.name,
+        comment_id: context.payload.comment.id,
+        body: `<!-- {"sys_id":"${sys_id}" -->\r\n${comment_body}`,
+    });
 };
-
-// Gets all incidents?  Prolly paginated curl -H "Authorization: Basic $(echo -n admin:hKBjFd9JZh4m | base64)" https://dev64641.service-now.com/api/now/table/incident | jq '.result[0]'
-// curl --user admin:hKBjFd9JZh4m --header "Content-Type:application/json" --header "Accept: application/json" --request POST --data '{"short_description": "Test with CURL"}' https://dev64641.service-now.com/api/now/table/incident
-/* Result: {
-    "result": {
-        "parent": "",
-        "made_sla": "true",
-        "caused_by": "",
-        "watch_list": "",
-        "upon_reject": "cancel",
-        "sys_updated_on": "2021-01-06 15:14:18",
-        "child_incidents": "0",
-        "hold_reason": "",
-        "task_effective_number": "INC0010016",
-        "approval_history": "",
-        "number": "INC0010016",
-        "resolved_by": "",
-        "sys_updated_by": "admin",
-        "opened_by": {
-            "link": "https://dev64641.service-now.com/api/now/table/sys_user/6816f79cc0a8016401c5a33be04be441",
-            "value": "6816f79cc0a8016401c5a33be04be441"
-        },
-        "user_input": "",
-        "sys_created_on": "2021-01-06 15:14:18",
-        "sys_domain": {
-            "link": "https://dev64641.service-now.com/api/now/table/sys_user_group/global",
-            "value": "global"
-        },
-        "state": "1",
-        "route_reason": "",
-        "sys_created_by": "admin",
-        "knowledge": "false",
-        "order": "",
-        "calendar_stc": "",
-        "closed_at": "",
-        "cmdb_ci": "",
-        "delivery_plan": "",
-        "contract": "",
-        "impact": "3",
-        "active": "true",
-        "work_notes_list": "",
-        "business_service": "",
-        "priority": "5",
-        "sys_domain_path": "/",
-        "rfc": "",
-        "time_worked": "",
-        "expected_start": "",
-        "opened_at": "2021-01-06 15:14:18",
-        "business_duration": "",
-        "group_list": "",
-        "work_end": "",
-        "caller_id": "",
-        "reopened_time": "",
-        "resolved_at": "",
-        "approval_set": "",
-        "subcategory": "",
-        "work_notes": "",
-        "universal_request": "",
-        "short_description": "Test with CURL",
-        "close_code": "",
-        "correlation_display": "",
-        "delivery_task": "",
-        "work_start": "",
-        "assignment_group": "",
-        "additional_assignee_list": "",
-        "business_stc": "",
-        "description": "",
-        "calendar_duration": "",
-        "close_notes": "",
-        "notify": "1",
-        "service_offering": "",
-        "sys_class_name": "incident",
-        "closed_by": "",
-        "follow_up": "",
-        "parent_incident": "",
-        "sys_id": "aae8d9eddba920108cbf4870399619e4",
-        "contact_type": "",
-        "reopened_by": "",
-        "incident_state": "1",
-        "urgency": "3",
-        "problem_id": "",
-        "company": "",
-        "reassignment_count": "0",
-        "activity_due": "",
-        "assigned_to": "",
-        "severity": "3",
-        "comments": "",
-        "approval": "not requested",
-        "sla_due": "",
-        "comments_and_work_notes": "",
-        "due_date": "",
-        "sys_mod_count": "0",
-        "reopen_count": "0",
-        "sys_tags": "",
-        "escalation": "0",
-        "upon_approval": "proceed",
-        "correlation_id": "",
-        "location": "",
-        "category": "inquiry"
-    }
-} */
-
-// update: curl --user admin:hKBjFd9JZh4m --header "Content-Type:application/json" --header "Accept: application/json" --request PUT --data '{"short_description": "Test with CURL I AM AN UPDATE"}' https://dev64641.service-now.com/api/now/table/incident/aae8d9eddba920108cbf4870399619e4
